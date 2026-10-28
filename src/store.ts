@@ -284,7 +284,7 @@ export function findCodeFences(text: string): CodeFenceRegion[] {
       const marker = match?.[1];
       const closingText = match?.[2];
       if (marker && marker[0] === openFence.marker[0] && marker.length >= openFence.marker.length && /^\s*$/.test(closingText!)) {
-        regions.push({ start: openFence.start, end: lineStart + marker.length });
+        regions.push({ start: openFence.start, end: lineStart + line.length - closingText!.length });
         openFence = undefined;
       }
     } else if (match && (match[1]![0] !== "`" || !match[2]!.includes("`"))) {
@@ -482,12 +482,12 @@ export function chunkDocumentWithBreakPoints(
   maxChars: number = CHUNK_SIZE_CHARS,
   overlapChars: number = CHUNK_OVERLAP_CHARS,
   windowChars: number = CHUNK_WINDOW_CHARS
-): { text: string; pos: number }[] {
+): { text: string; pos: number; prefixLength: number }[] {
   if (content.length <= maxChars) {
-    return [{ text: content, pos: 0 }];
+    return [{ text: content, pos: 0, prefixLength: 0 }];
   }
 
-  const chunks: { text: string; pos: number }[] = [];
+  const chunks: { text: string; pos: number; prefixLength: number }[] = [];
   const tableRegions = findTableRegions(content, codeFences);
   const tableBreakPoints: BreakPoint[] = tableRegions.flatMap(table => [
     { pos: table.start > 0 ? table.start - 1 : table.start, score: 60, type: "table-start" },
@@ -501,6 +501,7 @@ export function chunkDocumentWithBreakPoints(
     return !table || bp.pos <= table.start || table.end - table.start > maxChars * 1.5;
   });
   let charPos = 0;
+  let lastEnd = 0;
 
   while (charPos < content.length) {
     const targetEndPos = Math.min(charPos + maxChars, content.length);
@@ -533,12 +534,27 @@ export function chunkDocumentWithBreakPoints(
     // remote embedding APIs.
     endPos = adjustSurrogateBoundary(content, endPos, charPos);
 
-    // When a table row itself exceeds the chunk budget, keep the row intact
-    // even if no newline breakpoint falls inside the search window.
+    // A table that fits the budget is re-emitted whole from its start by the
+    // overlap rewind below, so cutting inside it would emit its leading rows
+    // twice. End the chunk just before such a table instead. When a table row
+    // itself exceeds the chunk budget, keep the row intact even if no newline
+    // breakpoint falls inside the search window.
     const tableAtChunkEnd = findTableRegionAt(endPos, tableRegions);
-    if (tableAtChunkEnd && content[endPos] !== "\n") {
-      const rowEnd = content.indexOf("\n", endPos);
-      endPos = rowEnd === -1 ? content.length : rowEnd;
+    if (tableAtChunkEnd && (content[endPos] !== "\n" || endPos < tableAtChunkEnd.headerEnd)) {
+      const fitsBudget = tableAtChunkEnd.end - tableAtChunkEnd.start <= maxChars * 1.5;
+      if (fitsBudget && tableAtChunkEnd.start - 1 > charPos) {
+        // Prose before the table that the previous chunk already holds would
+        // make this chunk pure overlap, so start at the table instead.
+        if (tableAtChunkEnd.start - 1 <= lastEnd) {
+          charPos = tableAtChunkEnd.start;
+          continue;
+        }
+        endPos = tableAtChunkEnd.start - 1;
+      } else {
+        // Never end inside the header: a chunk holding only the header is useless.
+        const rowEnd = content.indexOf("\n", Math.max(endPos, tableAtChunkEnd.headerEnd));
+        endPos = rowEnd === -1 ? content.length : rowEnd;
+      }
     }
 
     const tableAtChunkStart = findTableRegionAt(charPos, tableRegions);
@@ -548,7 +564,8 @@ export function chunkDocumentWithBreakPoints(
       ? tableAtChunkStart
       : undefined;
     const prefix = continuedTable ? content.slice(continuedTable.start, continuedTable.headerEnd) : "";
-    chunks.push({ text: prefix + content.slice(charPos, endPos), pos: charPos });
+    chunks.push({ text: prefix + content.slice(charPos, endPos), pos: charPos, prefixLength: prefix.length });
+    lastEnd = endPos;
 
     if (endPos >= content.length) {
       break;
@@ -557,7 +574,9 @@ export function chunkDocumentWithBreakPoints(
     const tableAtNextStart = findTableRegionAt(charPos, tableRegions);
     if (tableAtNextStart) {
       if (tableAtNextStart.end - tableAtNextStart.start <= maxChars * 1.5) {
-        charPos = tableAtNextStart.start;
+        // A table the chunk just emitted holds whole adds nothing to the
+        // overlap; rewinding to its start would emit it a second time.
+        charPos = tableAtNextStart.end <= endPos ? tableAtNextStart.end : tableAtNextStart.start;
       } else {
         if (content[charPos] === "\n") charPos++;
         const lineStart = content.lastIndexOf("\n", charPos - 1) + 1;
@@ -3842,7 +3861,7 @@ export function chunkDocument(
   maxChars: number = CHUNK_SIZE_CHARS,
   overlapChars: number = CHUNK_OVERLAP_CHARS,
   windowChars: number = CHUNK_WINDOW_CHARS
-): { text: string; pos: number }[] {
+): { text: string; pos: number; prefixLength: number }[] {
   const breakPoints = scanBreakPoints(content);
   const codeFences = findCodeFences(content);
   return chunkDocumentWithBreakPoints(content, breakPoints, codeFences, maxChars, overlapChars, windowChars);
@@ -3863,7 +3882,7 @@ export async function chunkDocumentAsync(
   windowChars: number = CHUNK_WINDOW_CHARS,
   filepath?: string,
   chunkStrategy: ChunkStrategy = "regex",
-): Promise<{ text: string; pos: number }[]> {
+): Promise<{ text: string; pos: number; prefixLength: number }[]> {
   const regexPoints = scanBreakPoints(content);
   const codeFences = findCodeFences(content);
 
@@ -3961,12 +3980,17 @@ async function chunkDocumentByTokensWithLlm(
 
   // Tokenize and split any chunks that still exceed limit
   const results: { text: string; pos: number; tokens: number }[] = [];
+  // Source span of the last emitted piece, so a piece that repeats it can be dropped.
+  let lastSpan: { pos: number; end: number } | undefined;
   const clampOverlapChars = (value: number, maxChars: number): number => {
     if (maxChars <= 1) return 0;
     return Math.max(0, Math.min(maxChars - 1, Math.floor(value)));
   };
 
-  const pushChunkWithinTokenLimit = async (text: string, pos: number): Promise<void> => {
+  // `pos` is the source offset of text[prefixLength]: the first prefixLength
+  // characters of a continued table chunk are its header, repeated and not
+  // present at that offset in the source.
+  const pushChunkWithinTokenLimit = async (text: string, pos: number, prefixLength: number): Promise<void> => {
     if (signal?.aborted) return;
 
     const tokens = await llm.tokenize(text);
@@ -3976,6 +4000,11 @@ async function chunkDocumentByTokensWithLlm(
       // so this only ever strips something for already-malformed input.
       const safeText = stripUnpairedSurrogates(text);
       if (safeText.length === 0) return;
+      // A piece whose source span lies inside the previous piece's adds nothing;
+      // splitting a row that nearly fills the budget can produce such pieces.
+      const end = pos + safeText.length - prefixLength;
+      if (lastSpan && pos >= lastSpan.pos && end <= lastSpan.end) return;
+      lastSpan = { pos, end };
       results.push({ text: safeText, pos, tokens: tokens.length });
       return;
     }
@@ -3992,24 +4021,24 @@ async function chunkDocumentByTokensWithLlm(
       safeMaxChars,
     );
     let nextWindowChars = Math.max(0, Math.floor(windowChars * actualCharsPerToken / 2));
+    // Each recursion step must strictly shrink every piece. A continued table
+    // re-adds its header to each piece, so a piece can match its parent's length
+    // when the header and one row already exceed the budget.
+    const splitsProgress = (subs: { text: string }[]): boolean =>
+      subs.length > 1 && subs.every(sub => sub.text.length < text.length);
+
     let subChunks = chunkDocument(text, safeMaxChars, nextOverlapChars, nextWindowChars);
 
     // Pathological single-line blobs can produce no meaningful breakpoint progress.
     // Fall back to a simple half split so every recursion step strictly shrinks.
-    if (
-      subChunks.length <= 1
-      || subChunks[0]?.text.length === text.length
-    ) {
+    if (!splitsProgress(subChunks)) {
       safeMaxChars = Math.max(1, Math.floor(text.length / 2));
       nextOverlapChars = 0;
       nextWindowChars = 0;
       subChunks = chunkDocument(text, safeMaxChars, nextOverlapChars, nextWindowChars);
     }
 
-    if (
-      subChunks.length <= 1
-      || subChunks[0]?.text.length === text.length
-    ) {
+    if (!splitsProgress(subChunks)) {
       const fallbackTokens = tokens.slice(0, Math.max(1, maxTokens));
       // Safety net: detokenize() reconstructs text from raw token IDs, and
       // a tokenizer can encode a single astral-plane character across
@@ -4024,13 +4053,22 @@ async function chunkDocumentByTokensWithLlm(
       return;
     }
 
+    // subChunk.text is the authoritative piece (re-slicing `text` by its length
+    // would drop a continued table's header). subChunk.pos indexes `text`, so
+    // map it back to the source: text[prefixLength] sits at `pos`.
     for (const subChunk of subChunks) {
-      await pushChunkWithinTokenLimit(text.slice(subChunk.pos, subChunk.pos + subChunk.text.length), pos + subChunk.pos);
+      // A piece starting inside this text's header carries that header as
+      // literal text, so its synthetic prefix is what remains of it.
+      await pushChunkWithinTokenLimit(
+        subChunk.text,
+        pos + Math.max(0, subChunk.pos - prefixLength),
+        Math.max(subChunk.prefixLength, prefixLength - subChunk.pos),
+      );
     }
   };
 
   for (const chunk of charChunks) {
-    await pushChunkWithinTokenLimit(chunk.text, chunk.pos);
+    await pushChunkWithinTokenLimit(chunk.text, chunk.pos, chunk.prefixLength);
   }
 
   return results;
